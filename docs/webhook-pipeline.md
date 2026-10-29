@@ -134,16 +134,16 @@ The most complex handler — it must correctly determine the enforced quota tier
 
 ```mermaid
 flowchart TD
-    A[customer.subscription.updated] --> B[Extract status, plan_tier,\nperiod, seats from payload]
-    B --> C{status in\nactive / trialing / past_due?}
-    C -- Yes --> D[enforced_tier = plan_tier]
-    C -- No --> E[enforced_tier = free]
-    D --> F[UPDATE subscriptions]
+    A["customer.subscription.updated"] --> B["Extract status, plan_tier,\nperiod, seats from payload"]
+    B --> C{"status in\nactive / trialing / past_due?"}
+    C -- Yes --> D["enforced_tier = plan_tier"]
+    C -- No --> E["enforced_tier = free"]
+    D --> F["UPDATE subscriptions"]
     E --> F
-    F --> G[sync_user_quota_plan\nenforced_tier]
-    G --> H{plan_tier == team\nand seats not null?}
-    H -- Yes --> I[SET seats = quantity\nfrom items.data\[0\].quantity]
-    H -- No --> J[Leave seats unchanged]
-    I --> K[Done]
+    F --> G["sync_user_quota_plan\nenforced_tier"]
+    G --> H{"plan_tier == team\nand seats not null?"}
+    H -- Yes --> I["SET seats = items.data[0].quantity"]
+    H -- No --> J["Leave seats unchanged"]
+    I --> K["Done"]
     J --> K
 ```
