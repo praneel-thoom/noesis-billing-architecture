@@ -2,53 +2,16 @@
 
 The webhook endpoint at `POST /webhooks/stripe` is the single entry point for all Stripe-initiated state changes.
 
-## Full Pipeline Sequence
+## Request Lifecycle
 
 ```mermaid
-sequenceDiagram
-    participant S as Stripe
-    participant API as FastAPI<br/>/webhooks/stripe
-    participant DB as Supabase
-
-    S->>API: POST /webhooks/stripe<br/>Stripe-Signature header
-
-    alt Production / Staging
-        API->>API: stripe.Webhook.construct_event()<br/>verify HMAC signature
-        Note over API: Returns 400 if signature invalid<br/>Returns 500 if STRIPE_WEBHOOK_SECRET unset
-    else Development
-        API->>API: Parse raw JSON<br/>(no signature check)
-    end
-
-    API->>DB: INSERT INTO stripe_webhook_events<br/>(event_id, type)<br/>ON CONFLICT DO NOTHING
-    DB-->>API: rows_affected (1=new, 0=duplicate)
-
-    alt Duplicate event
-        API-->>S: 200 {"status": "duplicate"}
-    else New event
-        API->>API: Dispatch by event_type
-
-        alt checkout.session.completed
-            API->>DB: UPSERT subscriptions<br/>(status=active, plan_tier, stripe IDs)
-            API->>DB: UPDATE user_quotas<br/>sync_user_quota_plan()
-        else customer.subscription.updated
-            API->>DB: UPDATE subscriptions<br/>(status, period, cancel_at_period_end, seats)
-            API->>DB: UPDATE user_quotas<br/>(paid tier if active/trialing/past_due,<br/>else free)
-        else customer.subscription.deleted
-            API->>DB: UPDATE subscriptions<br/>(plan_tier=free, status=canceled, seats=NULL)
-            API->>DB: UPDATE user_quotas<br/>sync to free
-        else invoice.payment_failed
-            API->>DB: UPDATE subscriptions<br/>(status=past_due,<br/>last_payment_failed_at=NOW())
-            Note over API,DB: Paid tier access retained
-        else invoice.payment_succeeded
-            API->>DB: UPDATE subscriptions<br/>(status=active,<br/>last_payment_failed_at=NULL)
-            API->>DB: UPDATE user_quotas<br/>re-sync to paid tier
-        else Unknown event type
-            Note over API: Accepted and ignored<br/>(prevents Stripe retries)
-        end
-
-        Note over API: All handler exceptions caught and logged<br/>Endpoint always returns 200
-        API-->>S: 200 {"status": "ok", "event_type": "..."}
-    end
+flowchart LR
+    A(["Stripe"]) -->|POST + Stripe-Signature| B["Verify\nSignature"]
+    B -- invalid --> E1["400 / 500"]
+    B -- valid --> C["Idempotency\nCheck"]
+    C -- duplicate --> E2["200 duplicate"]
+    C -- new --> D["Dispatch\nto Handler"]
+    D --> F["200 ok"]
 ```
 
 ---
@@ -73,7 +36,7 @@ stripe.Webhook.construct_event(
 
 ### Idempotency
 
-Stripe may deliver the same event more than once (retries on non-2xx, network issues). The `stripe_webhook_events` table acts as a deduplication log:
+Stripe may deliver the same event more than once. The `stripe_webhook_events` table deduplicates:
 
 ```sql
 INSERT INTO stripe_webhook_events (event_id, type)
@@ -81,7 +44,7 @@ VALUES ($1, $2)
 ON CONFLICT (event_id) DO NOTHING;
 ```
 
-If `rows_affected = 0`, the event was already processed — the endpoint returns `200 {"status": "duplicate"}` immediately without re-running handlers.
+If `rows_affected = 0`, the endpoint returns `200 {"status": "duplicate"}` without re-running handlers.
 
 ---
 
@@ -100,7 +63,7 @@ If `rows_affected = 0`, the event was already processed — the endpoint returns
 
 ## Error Handling
 
-All event handler functions are wrapped in broad exception handling:
+All handler functions are wrapped in broad exception handling:
 
 ```python
 try:
@@ -110,10 +73,7 @@ except Exception as e:
     # Not re-raised — endpoint still returns 200
 ```
 
-This design means:
-- Stripe never retries due to a handler crash (retries would cause duplicate-processing noise)
-- Handler failures surface in application logs / Sentry only
-- The idempotency record is written **before** handlers run, so a crash on first delivery means a retry would be treated as a duplicate
+The idempotency record is written **before** handlers run, so a crash on first delivery means a Stripe retry is treated as a duplicate and skipped. Failures surface in application logs / Sentry only.
 
 ---
 
@@ -130,20 +90,17 @@ This design means:
 
 ## Handler Detail: `handle_subscription_updated`
 
-The most complex handler — it must correctly determine the enforced quota tier from the incoming status:
+The most complex handler — determines the enforced quota tier from the incoming subscription status:
 
 ```mermaid
 flowchart TD
-    A["customer.subscription.updated"] --> B["Extract status, plan_tier,\nperiod, seats from payload"]
-    B --> C{"status in\nactive / trialing / past_due?"}
-    C -- Yes --> D["enforced_tier = plan_tier"]
-    C -- No --> E["enforced_tier = free"]
-    D --> F["UPDATE subscriptions"]
-    E --> F
-    F --> G["sync_user_quota_plan\nenforced_tier"]
-    G --> H{"plan_tier == team\nand seats not null?"}
-    H -- Yes --> I["SET seats = items.data[0].quantity"]
-    H -- No --> J["Leave seats unchanged"]
-    I --> K["Done"]
-    J --> K
+    A["customer.subscription.updated"] --> B{"status in active /\ntrialing / past_due?"}
+    B -- Yes --> C["enforced_tier = plan_tier"]
+    B -- No --> D["enforced_tier = free"]
+    C --> E["UPDATE subscriptions\n+ sync quota"]
+    D --> E
+    E --> F{"plan == team\nand seats present?"}
+    F -- Yes --> G["Write seat count\nto subscriptions.seats"]
+    F -- No --> H["Done"]
+    G --> H
 ```

@@ -2,39 +2,37 @@
 
 End-to-end flow from initial signup through subscription management, covering checkout, subscription state transitions, dunning, and cancellation.
 
-## Checkout Flow
+## Checkout: Initiating a Session
 
 ```mermaid
 sequenceDiagram
     participant U as User
-    participant FE as Frontend
     participant BE as Backend
-    participant SS as stripe_service
     participant S as Stripe
+
+    U->>BE: POST /subscriptions/checkout
+    Note over BE: Look up or create Stripe customer
+    BE->>S: Create Checkout Session
+    S-->>BE: session.url
+    BE-->>U: Redirect to Stripe Checkout
+    U->>S: Completes payment
+    S-->>U: Redirect to success_url
+```
+
+## Checkout: Post-Payment Processing
+
+```mermaid
+sequenceDiagram
+    participant S as Stripe
+    participant BE as Backend
     participant DB as Supabase
 
-    U->>FE: Clicks "Subscribe" on Pricing page
-    FE->>BE: POST /subscriptions/checkout<br/>{ plan_tier, success_url, cancel_url, team_seats? }
-    BE->>SS: create_checkout_session(user_id, plan_tier, ...)
-
-    SS->>DB: SELECT stripe_customer_id FROM subscriptions
-    alt No existing customer
-        SS->>S: stripe.Customer.create(email, metadata)
-        S-->>SS: cus_xxx
-        SS->>DB: UPSERT subscriptions (stripe_customer_id)
-    end
-
-    SS->>S: stripe.checkout.Session.create(<br/>  customer=cus_xxx,<br/>  line_items=[{price_id, quantity}],<br/>  mode=subscription,<br/>  metadata={user_id, plan_tier}<br/>)
-    S-->>SS: session.url, session.id
-    SS-->>BE: { checkout_url, session_id }
-    BE-->>FE: { checkout_url, session_id }
-    FE->>U: Redirect to Stripe Hosted Checkout
-
-    U->>S: Completes payment
-    S->>FE: Redirect to success_url?subscribed=true&plan=pro
-    S->>BE: POST /webhooks/stripe (checkout.session.completed)
-    BE->>DB: UPSERT subscriptions (status=active, plan_tier, stripe IDs)
-    BE->>DB: UPDATE user_quotas (sync to paid tier)
+    S->>BE: POST /webhooks/stripe
+    Note over BE: checkout.session.completed
+    BE->>DB: UPSERT subscriptions
+    Note over DB: status=active, plan_tier, stripe IDs
+    BE->>DB: sync_user_quota_plan()
+    Note over DB: Update limits without resetting counters
 ```
 
 ---
@@ -43,38 +41,24 @@ sequenceDiagram
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Free: User signs up
+    [*] --> Free: signs up
 
     Free --> CheckoutInitiated: POST /subscriptions/checkout
-    CheckoutInitiated --> Active: checkout.session.completed\n(payment succeeds)
-    CheckoutInitiated --> Free: User abandons checkout
+    CheckoutInitiated --> Active: payment succeeds
+    CheckoutInitiated --> Free: checkout abandoned
 
-    Active --> Trialing: Trial started\n(if trial period configured)
-    Trialing --> Active: Trial ends, first invoice paid
+    Active --> Trialing: trial started
+    Trialing --> Active: trial ends
 
-    Active --> PastDue: invoice.payment_failed\n(card declined, expired)
-    PastDue --> Active: invoice.payment_succeeded\n(retry succeeds)
-    PastDue --> Canceled: Stripe gives up retrying\n(customer.subscription.deleted)
+    Active --> PastDue: invoice.payment_failed
+    PastDue --> Active: invoice.payment_succeeded
+    PastDue --> Canceled: subscription.deleted
 
-    Active --> CancelScheduled: POST /subscriptions/cancel\n(cancel_immediately=false)
-    CancelScheduled --> Canceled: Billing period ends\n(customer.subscription.deleted)
-    Active --> Canceled: POST /subscriptions/cancel\n(cancel_immediately=true)
+    Active --> CancelScheduled: cancel at period end
+    CancelScheduled --> Canceled: period ends
+    Active --> Canceled: cancel immediately
 
-    Canceled --> Free: customer.subscription.deleted\nhandler downgrades quota
-
-    note right of PastDue
-        Dunning grace policy:
-        past_due retains full
-        paid-tier access.
-        last_payment_failed_at
-        is set for UI banner.
-    end note
-
-    note right of CancelScheduled
-        cancel_at_period_end=true
-        User retains access
-        until period end.
-    end note
+    Canceled --> Free: quota downgraded
 ```
 
 ---
@@ -89,7 +73,7 @@ When a payment fails, Stripe retries automatically over several days. Noesis ret
 | `past_due` | Full paid access (grace) | Set to failure timestamp |
 | `canceled` / `incomplete` | Free tier only | Preserved (audit trail) |
 
-On payment recovery (`invoice.payment_succeeded`), `last_payment_failed_at` is cleared and `status` returns to `active`. The frontend can read `last_payment_failed_at` to show a payment failure banner without hitting the Stripe API.
+On payment recovery (`invoice.payment_succeeded`), `last_payment_failed_at` is cleared and status returns to `active`. The frontend reads `last_payment_failed_at` to show a payment failure banner without hitting the Stripe API.
 
 ---
 
@@ -97,24 +81,20 @@ On payment recovery (`invoice.payment_succeeded`), `last_payment_failed_at` is c
 
 ```mermaid
 flowchart TD
-    A[POST /subscriptions/cancel] --> B{cancel_immediately?}
-
-    B -- false --> C[stripe.Subscription.modify\ncancel_at_period_end=true]
-    C --> D[UPDATE subscriptions\ncancel_at_period_end=true]
-    D --> E[User retains access\nuntil period end]
-    E --> F[Stripe fires\ncustomer.subscription.deleted\nat period end]
-    F --> G[Downgrade to free]
-
-    B -- true --> H[stripe.Subscription.delete]
-    H --> I[Stripe fires\ncustomer.subscription.deleted\nimmediately]
-    I --> G
+    A["POST /subscriptions/cancel"] --> B{"cancel_immediately?"}
+    B -- false --> C["Modify: cancel_at_period_end=true"]
+    B -- true --> D["Delete subscription now"]
+    C --> E["Access until period end"]
+    D --> F["Access ends immediately"]
+    E --> G["subscription.deleted webhook\ndowngrades quota to free"]
+    F --> G
 ```
 
 ---
 
 ## Billing Portal
 
-Users can manage their payment method, view invoices, and update their subscription directly via the Stripe Customer Portal:
+Users manage payment methods, invoices, and plan changes via the Stripe Customer Portal:
 
 ```
 POST /subscriptions/portal-session
@@ -122,7 +102,7 @@ POST /subscriptions/portal-session
 → { url: "https://billing.stripe.com/session/..." }
 ```
 
-The portal is hosted and managed entirely by Stripe — no custom invoice or payment-method UI is needed on the Noesis side.
+The portal is hosted by Stripe — no custom invoice or payment-method UI is needed on the Noesis side.
 
 ---
 
